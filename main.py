@@ -1,8 +1,9 @@
 import os
 import asyncio
+import json
 import random
-from typing import List
-from fastapi import FastAPI, HTTPException
+from typing import List, Set
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from openai import OpenAI
@@ -32,10 +33,58 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# ---------- WebSocket plumbing ----------  #
+clients: Set[WebSocket] = set()
+
+@app.websocket("/ws")
+
+async def ws_endpoint(ws: WebSocket):
+    await ws.accept()
+    clients.add(ws)
+    try:
+        while True:                          # keep connection alive
+            await ws.receive_text()          # ignore content; just ping-pong
+    except WebSocketDisconnect:
+        clients.discard(ws)
+
+def broadcast_npc_action(npc_id: int, action: str):   
+    payload = json.dumps({"npc_id": npc_id, "action": action})
+    for ws in list(clients):                 # copy → safe iteration
+        if ws.application_state.value == 2:  # CLOSED
+            clients.discard(ws)
+            continue
+        asyncio.create_task(ws.send_text(payload))
+# ----------------------------------------  #
 # Pydantic model for tick input
 class TickIn(BaseModel):
     npc_id: int
     text: str
+
+class RecallOut(BaseModel):
+    memories: list[str]
+
+# helper to fetch the N most-recent memories for an npc
+def get_recent_memories(npc_id: int, limit: int = 3) -> list[str]:
+    res = (supabase
+           .table("memories")
+           .select("content")
+           .eq("npc_id", npc_id)
+           .order("created_at", desc=True)
+           .limit(limit)
+           .execute())
+    return [row["content"] for row in (res.data or [])]
+
+@app.get("/recall", response_model=RecallOut)
+async def recall(npc_id: int):
+    return {"memories": get_recent_memories(npc_id)}
+
+# ---------------- save position -----------------------
+@app.post("/state")
+async def save_state(npc_id: int, x: float, y: float):
+    supabase.table("npc_state").upsert(
+        {"npc_id": npc_id, "x": x, "y": y}
+    ).execute()
+    return {"status": "ok"}
 
 def embed(text: str) -> list[float]:
     """Return the embedding vector for `text`."""
@@ -48,19 +97,24 @@ def embed(text: str) -> list[float]:
 
 async def ticker():
     """Background task that generates periodic observations for NPCs."""
-    while True:
-        for npc in NPC_IDS:
-            action = random.choice(EMOJIS)
-            # Generate embedding and insert memory
-            embedding = embed(action)
-            supabase.table("memories").insert({
-                "npc_id": npc,
-                "kind": "observation",
-                "content": action,
-                "embedding": embedding
-            }).execute()
-            print(f"[TICK] npc {npc} -> {action}")
-        await asyncio.sleep(5)
+    initial_positions: dict[int, tuple[float, float]] = {}
+    res = supabase.table("npc_state").select("*").execute()
+    for row in res.data or []:
+        initial_positions[row["npc_id"]] = (row["x"], row["y"])
+        while True:
+            for npc in NPC_IDS:
+                action = random.choice(EMOJIS)
+                # Generate embedding and insert memory
+                embedding = embed(action)
+                supabase.table("memories").insert({
+                    "npc_id": npc,
+                    "kind": "observation",
+                    "content": action,
+                    "embedding": embedding
+                }).execute()
+                broadcast_npc_action(npc, action)
+                print(f"[TICK] npc {npc} -> {action}")
+            await asyncio.sleep(5)
 
 @app.on_event("startup")
 async def start_ticker():
