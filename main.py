@@ -2,16 +2,24 @@ import os
 import asyncio
 import json
 import random
-from typing import List, Set
+from typing import List, Set, Dict
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from openai import OpenAI
 from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-# Global constants
+# Global constants  
 NPC_IDS = [1, 2, 3]
 EMOJIS = ["😀", "🚶", "💬", "🍞"]
+
+# WebSocket connections store
+active_connections: List[WebSocket] = []
+
+# In-memory state store
+npc_positions: Dict[int, dict] = {}
 
 # Load environment variables
 load_dotenv(dotenv_path=".env", override=True)
@@ -33,19 +41,42 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Configure CORS - more permissive for development
+origins = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "*"
+]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Initialize some test positions
+npc_positions = {
+    1: {"x": 100, "y": 100},
+    2: {"x": 200, "y": 200},
+    3: {"x": 300, "y": 300}
+}
+
 # ---------- WebSocket plumbing ----------  #
 clients: Set[WebSocket] = set()
 
 @app.websocket("/ws")
-
-async def ws_endpoint(ws: WebSocket):
-    await ws.accept()
-    clients.add(ws)
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    active_connections.append(websocket)
     try:
-        while True:                          # keep connection alive
-            await ws.receive_text()          # ignore content; just ping-pong
-    except WebSocketDisconnect:
-        clients.discard(ws)
+        while True:
+            await websocket.receive_text()
+    except Exception as e:
+        print(f"WebSocket error: {e}")
+        if websocket in active_connections:
+            active_connections.remove(websocket)
 
 def broadcast_npc_action(npc_id: int, action: str):   
     payload = json.dumps({"npc_id": npc_id, "action": action})
@@ -63,6 +94,11 @@ class TickIn(BaseModel):
 class RecallOut(BaseModel):
     memories: list[str]
 
+class StateUpdate(BaseModel):
+    npc_id: int
+    x: float
+    y: float
+
 # helper to fetch the N most-recent memories for an npc
 def get_recent_memories(npc_id: int, limit: int = 3) -> list[str]:
     res = (supabase
@@ -78,43 +114,79 @@ def get_recent_memories(npc_id: int, limit: int = 3) -> list[str]:
 async def recall(npc_id: int):
     return {"memories": get_recent_memories(npc_id)}
 
+@app.get("/state_dump")
+async def get_state():
+    """Return all saved NPC positions."""
+    print("[DEBUG] /state_dump called")
+    try:
+        positions = [{"npc_id": npc_id, **pos} for npc_id, pos in npc_positions.items()]
+        print(f"[DEBUG] Returning positions: {positions}")
+        return positions
+    except Exception as e:
+        print(f"[ERROR] Error in state_dump: {e}")
+        return []
+
 # ---------------- save position -----------------------
 @app.post("/state")
-async def save_state(npc_id: int, x: float, y: float):
-    supabase.table("npc_state").upsert(
-        {"npc_id": npc_id, "x": x, "y": y}
-    ).execute()
-    return {"status": "ok"}
+async def update_state(state: StateUpdate):
+    """Update an NPC's position."""
+    try:
+        npc_positions[state.npc_id] = {"x": state.x, "y": state.y}
+        return {"status": "ok"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 def embed(text: str) -> list[float]:
     """Return the embedding vector for `text`."""
-    resp = openai_client.embeddings.create(
-        model="text-embedding-3-small",
-        input=text,
-    )
-    # One input → one embedding
-    return resp.data[0].embedding
+    try:
+        resp = openai_client.embeddings.create(
+            model="text-embedding-3-small",
+            input=text,
+        )
+        return resp.data[0].embedding
+    except Exception as e:
+        print(f"Error generating embedding: {e}")
+        return []
+
+async def broadcast_action(npc_id: int, action: str):
+    """Send action to all connected WebSocket clients."""
+    message = {"npc_id": npc_id, "action": action}
+    for connection in active_connections[:]:  # Create a copy of the list
+        try:
+            await connection.send_json(message)
+        except Exception as e:
+            print(f"Error sending to websocket: {e}")
+            try:
+                active_connections.remove(connection)
+            except ValueError:
+                pass
 
 async def ticker():
     """Background task that generates periodic observations for NPCs."""
-    initial_positions: dict[int, tuple[float, float]] = {}
-    res = supabase.table("npc_state").select("*").execute()
-    for row in res.data or []:
-        initial_positions[row["npc_id"]] = (row["x"], row["y"])
-        while True:
+    while True:
+        try:
             for npc in NPC_IDS:
                 action = random.choice(EMOJIS)
                 # Generate embedding and insert memory
                 embedding = embed(action)
-                supabase.table("memories").insert({
-                    "npc_id": npc,
-                    "kind": "observation",
-                    "content": action,
-                    "embedding": embedding
-                }).execute()
-                broadcast_npc_action(npc, action)
+                if embedding:  # Only insert if embedding was generated
+                    try:
+                        supabase.table("memories").insert({
+                            "npc_id": npc,
+                            "kind": "observation",
+                            "content": action,
+                            "embedding": embedding
+                        }).execute()
+                    except Exception as e:
+                        print(f"Error inserting to Supabase: {e}")
+                
+                # Broadcast action to all connected clients
+                await broadcast_action(npc, action)
                 print(f"[TICK] npc {npc} -> {action}")
             await asyncio.sleep(5)
+        except Exception as e:
+            print(f"Error in ticker: {e}")
+            await asyncio.sleep(5)  # Still sleep on error
 
 @app.on_event("startup")
 async def start_ticker():
@@ -130,6 +202,8 @@ async def create_tick(tick: TickIn):
     try:
         # Generate embedding for the observation
         embedding = embed(tick.text)
+        if not embedding:
+            raise HTTPException(status_code=500, detail="Failed to generate embedding")
         
         # Insert the new memory
         supabase.table("memories").insert({
