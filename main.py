@@ -36,6 +36,40 @@ if not supabase_url or not supabase_key:
     raise ValueError("Missing Supabase credentials in environment variables")
 supabase: Client = create_client(supabase_url, supabase_key)
 
+# character definitions with nightly “daily_goal”
+CHAR: dict[int, dict[str, str]] = {
+    1: {
+        "name": "Phoebe Buffay",
+        "traits": "Free-spirited, mystical, abrupt honesty; writes odd folk songs",
+        "daily_goal": "Compose a brand-new song using sounds stolen from the party and perform it on the karaoke stage",
+    },
+    2: {
+        "name": "Sheldon Cooper",
+        "traits": "Genius, rigid routines, germ-averse, trivia enthusiast",
+        "daily_goal": "Claim the optimal seat, launch an uninvited 'Fun With Flags – Canada Edition', and correct three scientific inaccuracies",
+    },
+    3: {
+        "name": "Dwight Schrute",
+        "traits": "Beet farmer, volunteer sheriff, survivalist, territorial",
+        "daily_goal": "Secure the barn’s perimeter, sell at least five jars of 'Schrute Family Beet Relish', and log potential threats in his notebook",
+    },
+    4: {
+        "name": "Michael Scott",
+        "traits": "Attention-seeking, misreads tone, improvisational chaos",
+        "daily_goal": "Host an impromptu Dundie-style award ceremony and end the night believing everyone thinks he’s a ‘World’s Best Guest’",
+    },
+    5: {
+        "name": "David Rose",
+        "traits": "Sardonic, fashion-conscious, anxious yet empathetic",
+        "daily_goal": "Stay sweat-free, curate the three most aesthetically pleasing appetisers for his Instagram, and receive at least one genuine compliment",
+    },
+    6: {
+        "name": "Moira Rose",
+        "traits": "Dramatic vocabulary, loves applause, secretly fragile ego",
+        "daily_goal": "Deliver a flawless dramatic monologue, secure a single donation larger than Jocelyn’s entire bake sale, and execute a mid-party wig reveal",
+    },
+}
+
 # Initialize FastAPI app
 app = FastAPI(
     title="NPC Learn API",
@@ -169,15 +203,7 @@ async def broadcast_action(npc_id: int, action: str):
             except ValueError:
                 pass
 
-# ─── Character lookup table (place this near your constants) ─────────
-CHAR: dict[int, dict[str, str]] = {
-    1: {"name": "Phoebe Buffay",  "traits": "Free-spirited, mystical, blunt honesty"},
-    2: {"name": "Sheldon Cooper", "traits": "Genius, rigid routine, germ-averse"},
-    3: {"name": "Dwight Schrute", "traits": "Security-minded beet farmer, territorial"},
-    4: {"name": "Michael Scott",  "traits": "Attention-seeking, awkward, loves improv"},
-    5: {"name": "David Rose",     "traits": "Sardonic, fashion-conscious, anxious"},
-    6: {"name": "Moira Rose",     "traits": "Dramatic vocabulary, host, fragile ego"},
-}
+
 # (If this table already exists in your file, keep only one copy)
 
 # ─── helper to pick a random external event once per loop ─────────────
@@ -198,6 +224,7 @@ def parse_observation(raw: str) -> tuple[str, str]:
 async def ticker():
     """Background loop: every 5 s each NPC observes & acts."""
     tick_count = 0
+    planned = set()
     while True:
         tick_count += 1
         time_label = f"{tick_count * 5} sec"
@@ -205,6 +232,27 @@ async def ticker():
 
         for npc in NPC_IDS:
             char = CHAR[npc]
+
+            # one-time plan at beginning
+            if npc not in planned:
+                plan_prompt = render_tmpl(
+                    "plan.j2",
+                    name=char["name"],
+                    traits=char["traits"],
+                    daily_goal=char["daily_goal"],
+                )
+                plan_txt = (
+                    openai_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[{"role":"user","content":plan_prompt}],
+                        temperature=0.6,
+                        max_tokens=80,
+                    ).choices[0].message.content
+                )
+                supabase.table("memories").insert(
+                    {"npc_id": npc, "kind": "plan", "content": plan_txt, "embedding": None}
+                ).execute()
+                planned.add(npc)
 
             # 1️⃣ build prompt from Jinja template
             prompt = render_tmpl(
