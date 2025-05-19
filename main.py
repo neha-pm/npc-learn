@@ -2,6 +2,7 @@ import os
 import asyncio
 import json
 import random
+import re
 from typing import List, Set, Dict
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from dotenv import load_dotenv
@@ -51,9 +52,9 @@ origins = [
 
 # Jinja environment
 tmpl_env = Environment(loader=FileSystemLoader("prompts"))
-def render_tmpl(name: str, **kw) -> str:
+def render_tmpl(template_name: str, **kw) -> str:
     """Render prompts/*.j2 with keyword args."""
-    return tmpl_env.get_template(name).render(**kw)
+    return tmpl_env.get_template(template_name).render(**kw)
 
 app.add_middleware(
     CORSMiddleware,
@@ -168,32 +169,85 @@ async def broadcast_action(npc_id: int, action: str):
             except ValueError:
                 pass
 
+# ─── Character lookup table (place this near your constants) ─────────
+CHAR: dict[int, dict[str, str]] = {
+    1: {"name": "Phoebe Buffay",  "traits": "Free-spirited, mystical, blunt honesty"},
+    2: {"name": "Sheldon Cooper", "traits": "Genius, rigid routine, germ-averse"},
+    3: {"name": "Dwight Schrute", "traits": "Security-minded beet farmer, territorial"},
+    4: {"name": "Michael Scott",  "traits": "Attention-seeking, awkward, loves improv"},
+    5: {"name": "David Rose",     "traits": "Sardonic, fashion-conscious, anxious"},
+    6: {"name": "Moira Rose",     "traits": "Dramatic vocabulary, host, fragile ego"},
+}
+# (If this table already exists in your file, keep only one copy)
+
+# ─── helper to pick a random external event once per loop ─────────────
+EVENTS = ["", "POWER_FLICKER", "BEET_EMERGENCY", "MUSIC_SWAP"]
+def random_event() -> str:
+    """Return an event name or empty string (no event)."""
+    return random.choice(EVENTS)
+
+# ─── parse [emoji] Thought lines coming back from the LLM ─────────────
+EMOJI_RE = re.compile(r"^\s*\[([^\]]+)]\s*(.+)$")
+def parse_observation(raw: str) -> tuple[str, str]:
+    m = EMOJI_RE.match(raw.strip())
+    if not m:
+        return "🤔", raw.strip()
+    return m.group(1), m.group(2)
+
+# ─── NEW ticker() using observe.j2 template ───────────────────────────
 async def ticker():
-    """Background task that generates periodic observations for NPCs."""
+    """Background loop: every 5 s each NPC observes & acts."""
+    tick_count = 0
     while True:
-        try:
-            for npc in NPC_IDS:
-                action = random.choice(EMOJIS)
-                # Generate embedding and insert memory
-                embedding = embed(action)
-                if embedding:  # Only insert if embedding was generated
-                    try:
-                        supabase.table("memories").insert({
-                            "npc_id": npc,
-                            "kind": "observation",
-                            "content": action,
-                            "embedding": embedding
-                        }).execute()
-                    except Exception as e:
-                        print(f"Error inserting to Supabase: {e}")
-                
-                # Broadcast action to all connected clients
-                await broadcast_action(npc, action)
-                print(f"[TICK] npc {npc} -> {action}")
-            await asyncio.sleep(5)
-        except Exception as e:
-            print(f"Error in ticker: {e}")
-            await asyncio.sleep(5)  # Still sleep on error
+        tick_count += 1
+        time_label = f"{tick_count * 5} sec"
+        current_event = random_event()          # ""  or e.g. "POWER_FLICKER"
+
+        for npc in NPC_IDS:
+            char = CHAR[npc]
+
+            # 1️⃣ build prompt from Jinja template
+            prompt = render_tmpl(
+                "observe.j2",
+                name=char["name"],
+                traits=char["traits"],
+                time_label=time_label,
+                zone="ENTRANCE",               # replace with real zone if you track it
+                event=current_event or "none",
+                memories=get_recent_memories(npc, 3),
+            )
+
+            # 2️⃣ call OpenAI chat completion
+            reply = (
+                openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0.7,
+                    max_tokens=60,
+                )
+                .choices[0]
+                .message.content
+            )
+
+            emoji, thought = parse_observation(reply)
+            embedding = embed(thought)
+
+            # 3️⃣ store new memory row
+            supabase.table("memories").insert(
+                {
+                    "npc_id": npc,
+                    "kind": "observation",
+                    "content": f"{emoji} {thought}",
+                    "embedding": embedding,
+                }
+            ).execute()
+
+            # 4️⃣ broadcast to all viewers
+            broadcast_npc_action(npc, emoji)
+            print(f"[TICK] {char['name']} → {emoji} {thought}")
+
+        await asyncio.sleep(5)
+
 
 @app.on_event("startup")
 async def start_ticker():
