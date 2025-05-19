@@ -3,7 +3,7 @@ import asyncio
 import json
 import random
 import re
-from typing import List, Set, Dict
+from typing import List, Set, Dict, Optional
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -36,7 +36,7 @@ if not supabase_url or not supabase_key:
     raise ValueError("Missing Supabase credentials in environment variables")
 supabase: Client = create_client(supabase_url, supabase_key)
 
-# character definitions with nightly “daily_goal”
+# character definitions with nightly "daily_goal"
 CHAR: dict[int, dict[str, str]] = {
     1: {
         "name": "Phoebe Buffay",
@@ -51,12 +51,12 @@ CHAR: dict[int, dict[str, str]] = {
     3: {
         "name": "Dwight Schrute",
         "traits": "Beet farmer, volunteer sheriff, survivalist, territorial",
-        "daily_goal": "Secure the barn’s perimeter, sell at least five jars of 'Schrute Family Beet Relish', and log potential threats in his notebook",
+        "daily_goal": "Secure the barn's perimeter, sell at least five jars of 'Schrute Family Beet Relish', and log potential threats in his notebook",
     },
     4: {
         "name": "Michael Scott",
         "traits": "Attention-seeking, misreads tone, improvisational chaos",
-        "daily_goal": "Host an impromptu Dundie-style award ceremony and end the night believing everyone thinks he’s a ‘World’s Best Guest’",
+        "daily_goal": "Host an impromptu Dundie-style award ceremony and end the night believing everyone thinks he's a 'World's Best Guest'",
     },
     5: {
         "name": "David Rose",
@@ -66,8 +66,16 @@ CHAR: dict[int, dict[str, str]] = {
     6: {
         "name": "Moira Rose",
         "traits": "Dramatic vocabulary, loves applause, secretly fragile ego",
-        "daily_goal": "Deliver a flawless dramatic monologue, secure a single donation larger than Jocelyn’s entire bake sale, and execute a mid-party wig reveal",
+        "daily_goal": "Deliver a flawless dramatic monologue, secure a single donation larger than Jocelyn's entire bake sale, and execute a mid-party wig reveal",
     },
+}
+
+ZONE_COORDS = {
+    "ENTRANCE": (100, 100),
+    "BUFFET":   (150, 250),
+    "DANCE":    (350, 200),
+    "STAGE":    (550, 150),
+    "QUIET":    (300, 400),
 }
 
 # Initialize FastAPI app
@@ -104,6 +112,16 @@ npc_positions = {
     2: {"x": 200, "y": 200},
     3: {"x": 300, "y": 300}
 }
+
+ZONE_WORDS = "|".join(ZONE_COORDS.keys())
+ZONE_RE = re.compile(r"\b(" + ZONE_WORDS + r")\b", re.I)
+
+def extract_zone(thought: str) -> Optional[str]:
+    """Return zone name mentioned in text, else None."""
+    m = ZONE_RE.search(thought)
+    if m:
+        return m.group(1).upper()
+    return None
 
 # ---------- WebSocket plumbing ----------  #
 clients: Set[WebSocket] = set()
@@ -220,20 +238,32 @@ def parse_observation(raw: str) -> tuple[str, str]:
         return "🤔", raw.strip()
     return m.group(1), m.group(2)
 
-# ─── NEW ticker() using observe.j2 template ───────────────────────────
+# ─────────────────────────────────────────────────────────────
+# ticker() — with plan seeding, zone-aware prompts, movement
+# ─────────────────────────────────────────────────────────────
 async def ticker():
-    """Background loop: every 5 s each NPC observes & acts."""
+    """Background loop: every 5 s each NPC observes, acts, and may change zone."""
+    # --- one-time init  -------------------------------------------------
     tick_count = 0
-    planned = set()
+    planned: set[int] = set()              # npc_ids that already have a plan
+
+    # cache current zone per NPC from DB (defaults to ENTRANCE)
+    npc_zone: dict[int, str] = {
+        row["npc_id"]: row["zone"]
+        for row in (
+            supabase.table("npc_state").select("npc_id", "zone").execute().data or []
+        )
+    }
+
     while True:
         tick_count += 1
         time_label = f"{tick_count * 5} sec"
-        current_event = random_event()          # ""  or e.g. "POWER_FLICKER"
+        current_event = random_event()            # ""  or e.g. "POWER_FLICKER"
 
         for npc in NPC_IDS:
             char = CHAR[npc]
 
-            # one-time plan at beginning
+            # ── 1. nightly plan (runs once) ───────────────────────────
             if npc not in planned:
                 plan_prompt = render_tmpl(
                     "plan.j2",
@@ -244,28 +274,35 @@ async def ticker():
                 plan_txt = (
                     openai_client.chat.completions.create(
                         model="gpt-4o-mini",
-                        messages=[{"role":"user","content":plan_prompt}],
+                        messages=[{"role": "user", "content": plan_prompt}],
                         temperature=0.6,
                         max_tokens=80,
-                    ).choices[0].message.content
+                    )
+                    .choices[0]
+                    .message.content
                 )
                 supabase.table("memories").insert(
-                    {"npc_id": npc, "kind": "plan", "content": plan_txt, "embedding": None}
+                    {
+                        "npc_id": npc,
+                        "kind": "plan",
+                        "content": plan_txt,
+                        "embedding": None,
+                    }
                 ).execute()
                 planned.add(npc)
 
-            # 1️⃣ build prompt from Jinja template
+            # ── 2. observation prompt ────────────────────────────────
+            zone_now = npc_zone.get(npc, "ENTRANCE")
             prompt = render_tmpl(
                 "observe.j2",
                 name=char["name"],
                 traits=char["traits"],
                 time_label=time_label,
-                zone="ENTRANCE",               # replace with real zone if you track it
+                zone=zone_now,
                 event=current_event or "none",
                 memories=get_recent_memories(npc, 3),
             )
 
-            # 2️⃣ call OpenAI chat completion
             reply = (
                 openai_client.chat.completions.create(
                     model="gpt-4o-mini",
@@ -280,7 +317,7 @@ async def ticker():
             emoji, thought = parse_observation(reply)
             embedding = embed(thought)
 
-            # 3️⃣ store new memory row
+            # store observation
             supabase.table("memories").insert(
                 {
                     "npc_id": npc,
@@ -290,12 +327,20 @@ async def ticker():
                 }
             ).execute()
 
-            # 4️⃣ broadcast to all viewers
+            # ── 3. detect movement intent & update npc_state ─────────
+            new_zone = extract_zone(thought)
+            if new_zone and new_zone in ZONE_COORDS and new_zone != zone_now:
+                x, y = ZONE_COORDS[new_zone]
+                supabase.table("npc_state").upsert(
+                    {"npc_id": npc, "x": x, "y": y, "zone": new_zone}
+                ).execute()
+                npc_zone[npc] = new_zone          # update cache
+
+            # ── 4. broadcast emoji to viewers ───────────────────────
             broadcast_npc_action(npc, emoji)
             print(f"[TICK] {char['name']} → {emoji} {thought}")
 
         await asyncio.sleep(5)
-
 
 @app.on_event("startup")
 async def start_ticker():
