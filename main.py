@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse
 from jinja2 import Environment, FileSystemLoader
 
 # Global constants  
-NPC_IDS = [1, 2, 3]
+NPC_IDS = [1, 2, 3, 4, 5, 6]
 EMOJIS = ["😀", "🚶", "💬", "🍞"]
 
 # WebSocket connections store
@@ -269,85 +269,90 @@ async def ticker():
         current_event = random_event()            # ""  or e.g. "POWER_FLICKER"
 
         for npc in NPC_IDS:
-            char = CHAR[npc]
+            try:
+                char = CHAR[npc]
 
-            # ── 1. nightly plan (runs once) ───────────────────────────
-            if npc not in planned:
-                plan_prompt = render_tmpl(
-                    "plan.j2",
+                # ── 1. nightly plan (runs once) ───────────────────────────
+                if npc not in planned:
+                    plan_prompt = render_tmpl(
+                        "plan.j2",
+                        name=char["name"],
+                        traits=char["traits"],
+                        daily_goal=char["daily_goal"],
+                    )
+                    plan_txt = (
+                        openai_client.chat.completions.create(
+                            model="gpt-4o-mini",
+                            messages=[{"role": "user", "content": plan_prompt}],
+                            temperature=0.6,
+                            max_tokens=80,
+                        )
+                        .choices[0]
+                        .message.content
+                    )
+                    supabase.table("memories").insert(
+                        {
+                            "npc_id": npc,
+                            "kind": "plan",
+                            "content": plan_txt,
+                            "embedding": None,
+                        }
+                    ).execute()
+                    planned.add(npc)
+
+                # ── 2. observation prompt ────────────────────────────────
+                zone_now = npc_zone.get(npc, "ENTRANCE")
+                prompt = render_tmpl(
+                    "observe.j2",
                     name=char["name"],
                     traits=char["traits"],
-                    daily_goal=char["daily_goal"],
+                    time_label=time_label,
+                    zone=zone_now,
+                    event=current_event or "none",
+                    memories=get_recent_memories(npc, 3),
                 )
-                plan_txt = (
+
+                reply = (
                     openai_client.chat.completions.create(
                         model="gpt-4o-mini",
-                        messages=[{"role": "user", "content": plan_prompt}],
-                        temperature=0.6,
-                        max_tokens=80,
+                        messages=[{"role": "user", "content": prompt}],
+                        temperature=0.7,
+                        max_tokens=60,
                     )
                     .choices[0]
                     .message.content
                 )
+
+                emoji, thought = parse_observation(reply)
+                embedding = embed(thought)
+
+                # store observation
                 supabase.table("memories").insert(
                     {
                         "npc_id": npc,
-                        "kind": "plan",
-                        "content": plan_txt,
-                        "embedding": None,
+                        "kind": "observation",
+                        "content": f"{emoji} {thought}",
+                        "embedding": embedding,
                     }
                 ).execute()
-                planned.add(npc)
 
-            # ── 2. observation prompt ────────────────────────────────
-            zone_now = npc_zone.get(npc, "ENTRANCE")
-            prompt = render_tmpl(
-                "observe.j2",
-                name=char["name"],
-                traits=char["traits"],
-                time_label=time_label,
-                zone=zone_now,
-                event=current_event or "none",
-                memories=get_recent_memories(npc, 3),
-            )
+                # ── 3. detect movement intent & update npc_state ─────────
+                new_zone = extract_zone(thought)
+                if new_zone and new_zone in ZONE_COORDS and new_zone != zone_now:
+                    x, y = ZONE_COORDS[new_zone]
+                    # Directly upsert into npc_state table
+                    supabase.table("npc_state").upsert(
+                        {"npc_id": npc, "x": x, "y": y, "zone": new_zone}
+                    ).execute()
+                    npc_zone[npc] = new_zone          # update cache
 
-            reply = (
-                openai_client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=0.7,
-                    max_tokens=60,
-                )
-                .choices[0]
-                .message.content
-            )
-
-            emoji, thought = parse_observation(reply)
-            embedding = embed(thought)
-
-            # store observation
-            supabase.table("memories").insert(
-                {
-                    "npc_id": npc,
-                    "kind": "observation",
-                    "content": f"{emoji} {thought}",
-                    "embedding": embedding,
-                }
-            ).execute()
-
-            # ── 3. detect movement intent & update npc_state ─────────
-            new_zone = extract_zone(thought)
-            if new_zone and new_zone in ZONE_COORDS and new_zone != zone_now:
-                x, y = ZONE_COORDS[new_zone]
-                supabase.rpc("upsert_npc_state", {"_npc_id": npc, "_zone": new_zone}).execute()
-                npc_zone[npc] = new_zone          # update cache
-
-            # ── 4. broadcast emoji to viewers ───────────────────────
-            await broadcast_npc_action(npc, emoji, npc_zone.get(npc))
-            print(f"[TICK] {char['name']} → {emoji} {thought}")
+                # ── 4. broadcast emoji to viewers ───────────────────────
+                await broadcast_npc_action(npc, emoji, npc_zone.get(npc))
+                print(f"[TICK] {char['name']} → {emoji} {thought}")
+            except Exception as e:
+                print(f"[TICK ERROR] NPC {npc}: {e}")
 
         print("TICK LOOP STILL RUNNING: tick", tick_count)
-        
         await asyncio.sleep(5)
 
 @app.on_event("startup")
@@ -393,11 +398,9 @@ async def create_tick(tick: TickIn):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/reset")
-
 # ------------------------------------------------------------------
 # /reset  — wipe and reseed DB, then notify all viewers
 # ------------------------------------------------------------------
-@app.post("/reset")
 async def reset_world(request: Request):
     try:
         # 1️⃣  clear tables
@@ -434,12 +437,6 @@ async def reset_world(request: Request):
         check = supabase.table("npc_state").select("*").execute()
         print("NPC_STATE after reset →", check)
 
-        # for npc_id, zone, x, y in seed_pos:
-        #     resp = supabase.table("npc_state").upsert(
-        #         {"npc_id": npc_id, "x": x, "y": y, "zone": zone}
-        #     ).execute()
-        #     print("UPSERT npc_state", npc_id, "→", resp)
-
         # 4️⃣  clear any in-memory caches
         npc_positions.clear()        # ignore if variable doesn't exist
 
@@ -448,12 +445,17 @@ async def reset_world(request: Request):
             try:
                 await ws.send_json({"type": "RESET"})
             except Exception:
-                active_connections.remove(ws)
+                pass  # ignore errors
+        active_connections.clear()  # clear all after reset
 
         return {"status": "reset complete"}
 
     except Exception as err:
         raise HTTPException(status_code=500, detail=str(err))
+
+@app.get("/ping")
+async def ping():
+    return {"status": "ok"}
 
 if __name__ == "__main__":
     import uvicorn
