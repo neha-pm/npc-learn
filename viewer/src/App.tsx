@@ -1,6 +1,7 @@
 /* App.tsx – viewer */
 import { useEffect, useRef, useState, useCallback } from "react";
-import { Stage, Layer, Group, Text, Label, Tag, Image as KImage } from "react-konva";
+import React from "react";
+import { Stage, Layer, Group, Rect, Text, Label, Tag, Image as KImage } from "react-konva";
 import useImage from "use-image"; 
 
 function Avatar({ id, size = 40 }: { id: number; size?: number }) {
@@ -44,6 +45,24 @@ const ZONE: Record<string, { x: number; y: number }> = {
   QUIET:    { x: 300, y: 400 },
 };
 
+type ZoneInfo = { x: number; y: number; w: number; h: number; color: string };
+const ZONE_INFO: Record<string, ZoneInfo> = {
+  ENTRANCE: { x: 150, y: 125, w: 200, h: 150, color: 'rgba(100,150,240,0.9)' },
+  BUFFET:   { x: 400, y: 125, w: 200, h: 150, color: 'rgba(240,200,100,0.9)' },
+  STAGE:    { x: 650, y: 125, w: 200, h: 150, color: 'rgba(240,100,140,0.9)' },
+  DANCE:    { x: 275, y: 350, w: 200, h: 150, color: 'rgba(180,100,240,0.9)' },
+  QUIET:    { x: 525, y: 350, w: 200, h: 150, color: 'rgba(100,240,140,0.9)' },
+};
+
+// Emoji icons keyed by zone when they act
+const ZONE_EMOJI: Record<string,string> = {
+  ENTRANCE: '🚪',
+  BUFFET:   '🍽',
+  DANCE:    '💃',
+  STAGE:    '🎤',
+  QUIET:    '🤫',
+};
+
 const AVATAR: Record<number, string> = {
   1: "/avatars/phoebe.png",
   2: "/avatars/sheldon.png",
@@ -59,6 +78,10 @@ const OFFSET = 18; // px
 /* ───────────── Component ───────────── */
 export default function App() {
   const [npcs, setNpcs] = useState<Record<number, Npc>>({});
+  // currently selected NPC for detailed view
+  const [selectedNpc, setSelectedNpc] = useState<number|null>(null);
+  const [selectedNpcRecall, setSelectedNpcRecall] = useState<string[]>([]);
+  const [feed, setFeed] = useState<string[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
 
   /* -------- Reset World handler -------- */
@@ -81,15 +104,9 @@ export default function App() {
 
       const fresh: Record<number, Npc> = {};
       rows.forEach(({ npc_id, x, y, zone }) => {
-        // if backend sent x,y use them; otherwise derive from zone
-        const anchor =
-          x !== undefined && y !== undefined
-            ? { x, y }
-            : ZONE[zone] ?? randomPos();
-
+        const anchor = zone && ZONE[zone] ? ZONE[zone] : randomPos();
         const offX = (npc_id % 4) * OFFSET;
         const offY = Math.floor(npc_id / 4) * OFFSET;
-
         fresh[npc_id] = {
           id: npc_id,
           x: anchor.x + offX,
@@ -131,36 +148,26 @@ export default function App() {
 
       const { npc_id, action, zone } = msg as { npc_id: number; action: string; zone?: string };
       setNpcs((prev) => {
-        const current = prev[npc_id] ?? {
-          id: npc_id,
-          ...randomPos(),
-        };
-
-        /* zone anchor + deterministic offset */
-        const anchor = zone ? ZONE[zone] : undefined;
+        const anchor = zone && ZONE[zone] ? ZONE[zone] : randomPos();
         const offsetX = (npc_id % 4) * OFFSET;
         const offsetY = Math.floor(npc_id / 4) * OFFSET;
-
-        /* wobble if no anchor */
-        const dx = (Math.random() - 0.5) * 20;
-        const dy = (Math.random() - 0.5) * 20;
-
         return {
           ...prev,
           [npc_id]: {
-            ...current,
-            x:
-              anchor?.x !== undefined
-                ? anchor.x + offsetX
-                : Math.max(10, Math.min(WIDTH - 10, current.x + dx)),
-            y:
-              anchor?.y !== undefined
-                ? anchor.y + offsetY
-                : Math.max(10, Math.min(HEIGHT - 10, current.y + dy)),
-            bubble: action,       // store thought emoji
+            id: npc_id,
+            x: anchor.x + offsetX,
+            y: anchor.y + offsetY,
+            bubble: zone && ZONE_EMOJI[zone] ? ZONE_EMOJI[zone] : action,
           },
         };
       });
+      // Activity Feed update
+      if (msg.npc_id && msg.action && msg.zone) {
+        setFeed((prev) => [
+          `${msg.zone} → NPC ${msg.npc_id}: ${ZONE_EMOJI[msg.zone] || msg.action}`,
+          ...prev,
+        ]);
+      }
     };
 
     return () => ws.close();
@@ -170,95 +177,130 @@ export default function App() {
   const npcArray = Object.values(npcs);
 
   return (
-    <div className="flex flex-col items-center gap-2 p-4">
-      {/* Header row with Reset button */}
-      <div className="w-full max-w-[800px] flex justify-between items-center mb-4">
-        <h1 className="text-2xl font-bold">NPC World</h1>
+    <>
+      <header className="w-full flex justify-between items-center px-6 py-4 bg-gray-800">
+        <h1 className="text-3xl font-bold text-white">NPC World</h1>
         <button
           onClick={handleReset}
-          className="px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600 transition-colors"
+          className="flex items-center space-x-2 px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600"
         >
-          Reset World
+          <svg className="w-5 h-5" fill="currentColor" viewBox="0 0 20 20">
+            <path d="M10 2a8 8 0 100 16 8 8 0 000-16zm1 9H9V5h2v6zm0 4H9v-2h2v2z" />
+          </svg>
+          <span>Reset</span>
         </button>
-      </div>
-
-      {/* Canvas */}
-      <Stage width={WIDTH} height={HEIGHT} style={{ border: "1px solid #ccc" }}>
-        <Layer>
-          {npcArray.map((n) => (
-            <Group
-              key={n.id}
-              x={n.x}
-              y={n.y}
-              draggable
-              onDragEnd={(e) => {
-                const { x, y } = e.target.position();
-                setNpcs((prev) => ({ ...prev, [n.id]: { ...n, x, y } }));
-                fetch("http://localhost:8000/state", {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ npc_id: n.id, x, y }),
-                });
-              }}
-              onMouseEnter={() => (document.body.style.cursor = "pointer")}
-              onMouseLeave={() => (document.body.style.cursor = "default")}
-              onMouseOver={() => {
-                fetch(`http://localhost:8000/recall?npc_id=${n.id}`)
-                  .then((r) => r.json())
-                  .then((data: { memories: string[] }) =>
-                    setNpcs((prev) => ({
-                      ...prev,
-                      [n.id]: { ...n, tooltip: data.memories.join("\n") },
-                    }))
-                  );
-              }}
-              onMouseOut={() =>
-                setNpcs((prev) => ({
-                  ...prev,
-                  [n.id]: { ...n, tooltip: undefined },
-                }))
-              }
-            >
-              {/* avatar */}
-              <Avatar id={n.id} size={40} />
-
-              {/* thought bubble */}
-              {n.bubble && (
-                <Label offsetY={-30}>
-                  <Tag fill="#ffffff" stroke="#999" cornerRadius={4} />
-                  <Text
-                    text={n.bubble}
-                    fontSize={20}
-                    padding={4}
-                    fill="black"
-                    wrap="word"
-                    width={60}
-                    align="center"
+      </header>
+      <div className="flex w-full p-4 gap-4">
+        <main className="w-[70%] flex-shrink-0">
+          <Stage width={WIDTH} height={HEIGHT} style={{ border: "1px solid #ccc" }}>
+            <Layer>
+              {/* Zone backgrounds */}
+              {Object.entries(ZONE_INFO).map(([name, info]) => (
+                <Group key={name}>
+                  <Rect
+                    x={info.x - info.w / 2}
+                    y={info.y - info.h / 2}
+                    width={info.w}
+                    height={info.h}
+                    fill={info.color}
+                    stroke="#fff"
+                    strokeWidth={4}
+                    dash={[5, 5]}
+                    cornerRadius={8}
+                    shadowColor="#000"
+                    shadowBlur={10}
+                    shadowOpacity={0.4}
                   />
-                </Label>
-              )}
-
-              {n.tooltip && (
-                <Label offsetY={40}>
-                  <Tag fill="#fffbe6" stroke="#d4d4d4" cornerRadius={4} />
                   <Text
-                    text={n.tooltip}
-                    fontSize={14}
-                    padding={4}
-                    fill="black"
-                    width={160}
-                    wrap="word"
+                    text={name}
+                    x={info.x - info.w / 2 + 8}
+                    y={info.y - info.h / 2 + 8}
+                    fontSize={16}
+                    fontStyle="bold"
+                    fill="#fff"
+                    stroke="#000"
+                    strokeWidth={1}
                   />
-                </Label>
-              )}
-            </Group>
+                </Group>
+              ))}
+              {npcArray.map((n) => (
+                <Group
+                  key={n.id}
+                  x={n.x}
+                  y={n.y}
+                  draggable
+                  onClick={() => {
+                    setSelectedNpc(n.id);
+                    fetch(`http://localhost:8000/recall?npc_id=${n.id}`)
+                      .then((r) => r.json())
+                      .then((data: { memories: string[] }) => setSelectedNpcRecall(data.memories || []));
+                  }}
+                  onDragEnd={(e) => {
+                    const { x, y } = e.target.position();
+                    setNpcs((prev) => ({ ...prev, [n.id]: { ...n, x, y } }));
+                    fetch("http://localhost:8000/state", {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: JSON.stringify({ npc_id: n.id, x, y }),
+                    });
+                  }}
+                  onMouseEnter={() => (document.body.style.cursor = "pointer")}
+                  onMouseLeave={() => (document.body.style.cursor = "default")}
+                >
+                  {/* avatar */}
+                  <Avatar id={n.id} size={40} />
+
+                  {/* thought bubble */}
+                  {n.bubble && (
+                    <Label offsetY={-50}>
+                      <Tag fill="#ffffff" stroke="#999" cornerRadius={4} />
+                      <Text
+                        text={n.bubble}
+                        fontSize={18}
+                        padding={2}
+                        fill="black"
+                        wrap="word"
+                        width={50}
+                        align="center"
+                      />
+                    </Label>
+                  )}
+                </Group>
+              ))}
+            </Layer>
+          </Stage>
+          <p className="text-sm text-gray-500 mt-2">
+            Connected NPCs: {npcArray.length}
+          </p>
+          {selectedNpc !== null && (
+            <div className="fixed inset-0 z-50 bg-black bg-opacity-60 flex items-center justify-center">
+              <div className="bg-white p-6 rounded-lg shadow-lg max-w-md w-full">
+                <h2 className="text-2xl font-bold mb-4">Actions for NPC {selectedNpc}</h2>
+                <ul className="list-disc list-inside space-y-1 max-h-60 overflow-y-auto mb-4">
+                  {selectedNpcRecall.map((act, idx) => (
+                    <li key={idx}>{act}</li>
+                  ))}
+                </ul>
+                <button
+                  onClick={() => {
+                    setSelectedNpc(null);
+                    setSelectedNpcRecall([]);
+                  }}
+                  className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700"
+                >
+                  Close
+                </button>
+              </div>
+            </div>
+          )}
+        </main>
+        <aside className="w-[30%] bg-gray-900 bg-opacity-80 p-4 overflow-y-auto text-white">
+          <h2 className="text-lg font-semibold mb-2">Activity Feed</h2>
+          {feed.map((line, i) => (
+            <div key={i} className="text-sm mb-1">{line}</div>
           ))}
-        </Layer>
-      </Stage>
-
-      <p className="text-sm text-gray-500">
-        Connected NPCs: {npcArray.length}
-      </p>
-    </div>
+        </aside>
+      </div>
+    </>
   );
 }
