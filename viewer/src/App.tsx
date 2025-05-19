@@ -1,5 +1,5 @@
 /* App.tsx – viewer */
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import { Stage, Layer, Group, Text, Label, Tag } from "react-konva";
 
 const WIDTH = 800;
@@ -20,6 +20,7 @@ const randomPos = () => ({
   y: Math.random() * (HEIGHT - 40) + 20,
 });
 
+/* zone → fixed anchor coordinate */
 const ZONE: Record<string, { x: number; y: number }> = {
   ENTRANCE: { x: 100, y: 100 },
   BUFFET:   { x: 150, y: 250 },
@@ -28,6 +29,9 @@ const ZONE: Record<string, { x: number; y: number }> = {
   QUIET:    { x: 300, y: 400 },
 };
 
+/* deterministic offset so NPCs don’t pile up */
+const OFFSET = 18; // px
+
 /* ───────────── Component ───────────── */
 export default function App() {
   const [npcs, setNpcs] = useState<Record<number, Npc>>({});
@@ -35,76 +39,101 @@ export default function App() {
 
   /* -------- Reset World handler -------- */
   const handleReset = async () => {
-    try {
-      const res = await fetch("http://localhost:8000/reset", { method: "POST" });
-      if (!res.ok) throw new Error("Reset failed");
-      setNpcs({}); // wipe local view immediately
-    } catch (err) {
-      console.error(err);
-    }
+    const res = await fetch("http://localhost:8000/reset", { method: "POST" });
+    if (!res.ok) return;
+  
+    /* wipe local view */
+    setNpcs({});
+  
+    /* re-pull fresh positions */
+    loadStateDump();                // ← helper defined below
   };
+
+  const loadStateDump = useCallback(async () => {
+    try {
+      const res = await fetch("http://localhost:8000/state_dump");
+      const rows: { npc_id: number; x: number; y: number; zone: string }[] =
+        res.ok ? await res.json() : [];
+
+      const fresh: Record<number, Npc> = {};
+      rows.forEach(({ npc_id, x, y, zone }) => {
+        // if backend sent x,y use them; otherwise derive from zone
+        const anchor =
+          x !== undefined && y !== undefined
+            ? { x, y }
+            : ZONE[zone] ?? randomPos();
+
+        const offX = (npc_id % 4) * OFFSET;
+        const offY = Math.floor(npc_id / 4) * OFFSET;
+
+        fresh[npc_id] = {
+          id: npc_id,
+          x: anchor.x + offX,
+          y: anchor.y + offY,
+          emoji: "🙂",
+        };
+      });
+      setNpcs(fresh);
+    } catch (err) {
+      console.error("loadStateDump failed:", err);
+    }
+  }, []);
 
   /* -------- Initial load & WebSocket -------- */
   useEffect(() => {
     /* 1️⃣  load saved positions */
-    fetch("http://localhost:8000/state_dump")
-    .then((r) => (r.ok ? r.json() : []))
-    .then((rows: { npc_id: number; zone: string }[]) => {
-      const obj: Record<number, Npc> = {};
-      rows.forEach(({ npc_id, zone }) => {
-        const { x, y } = ZONE[zone] ?? randomPos();
-        obj[npc_id] = { id: npc_id, x, y, emoji: "🙂" };
-      });
-      setNpcs(obj);
-    });
+    loadStateDump();
 
-    /* 2️⃣  open WebSocket (uses same hostname as page) */
+    /* 2️⃣  open WebSocket (same host as page) */
     const host = window.location.hostname || "127.0.0.1";
     const ws = new WebSocket(`ws://${host}:8000/ws`);
     wsRef.current = ws;
 
     ws.onopen = () => console.log("✅ WebSocket connected");
+
     ws.onmessage = (e) => {
       const msg = JSON.parse(e.data) as {
-        type?: string;            // "RESET" for global wipes
+        type?: string;
         npc_id?: number;
         action?: string;
-        zone?: string;            // optional — we may add it later
+        zone?: string;
       };
-    
-      /* 1️⃣  Global reset broadcast */
+
       if (msg.type === "RESET") {
         setNpcs({});
+        loadStateDump();          // fetch new positions without refreshing page
         return;
       }
-    
-      /* 2️⃣  Normal NPC update payload */
       if (msg.npc_id === undefined || msg.action === undefined) return;
-    
+
       setNpcs((prev) => {
         const current = prev[msg.npc_id] ?? {
           id: msg.npc_id,
           ...randomPos(),
           emoji: msg.action,
         };
-    
-        /* ─ Zone override: if server sent a zone, use its fixed coords */
-        const zoneCoords = msg.zone ? ZONE[msg.zone] : undefined;
-    
-        /* ─ Otherwise: nudge position a little so they ‘wobble’ */
+
+        /* zone anchor + deterministic offset */
+        const anchor = msg.zone ? ZONE[msg.zone] : undefined;
+        const offsetX = (msg.npc_id % 4) * OFFSET;
+        const offsetY = Math.floor(msg.npc_id / 4) * OFFSET;
+
+        /* wobble if no anchor */
         const dx = (Math.random() - 0.5) * 20;
         const dy = (Math.random() - 0.5) * 20;
-    
+
         return {
           ...prev,
           [msg.npc_id]: {
             ...current,
             x:
-              zoneCoords?.x ??
-              Math.max(10, Math.min(WIDTH - 10, current.x + dx)),
+              anchor?.x !== undefined
+                ? anchor.x + offsetX
+                : Math.max(10, Math.min(WIDTH - 10, current.x + dx)),
             y:
-              zoneCoords?.y ??
-              Math.max(10, Math.min(HEIGHT - 10, current.y + dy)),
+              anchor?.y !== undefined
+                ? anchor.y + offsetY
+                : Math.max(10, Math.min(HEIGHT - 10, current.y + dy)),
             emoji: msg.action,
           },
         };

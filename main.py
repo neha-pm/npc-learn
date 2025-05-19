@@ -129,23 +129,39 @@ clients: Set[WebSocket] = set()
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    active_connections.append(websocket)
+    active_connections.append(websocket)   # or .add()
+
     try:
         while True:
-            await websocket.receive_text()
-    except Exception as e:
-        print(f"WebSocket error: {e}")
+            await asyncio.sleep(60)        # just keep it alive
+    except asyncio.CancelledError:
+        pass
+    finally:
         if websocket in active_connections:
             active_connections.remove(websocket)
 
-def broadcast_npc_action(npc_id: int, action: str):   
-    payload = json.dumps({"npc_id": npc_id, "action": action})
-    for ws in list(clients):                 # copy → safe iteration
-        if ws.application_state.value == 2:  # CLOSED
-            clients.discard(ws)
-            continue
-        asyncio.create_task(ws.send_text(payload))
+async def broadcast_npc_action(
+    npc_id: int,
+    emoji: str,
+    zone: Optional[str] = None,
+) -> None:
+    payload = {"npc_id": npc_id, "action": emoji}
+    if zone:
+        payload["zone"] = zone
+
+    stale: list[WebSocket] = []
+
+    for ws in active_connections:
+        try:
+            await ws.send_json(payload)      # <- await = no overlap
+        except Exception:
+            stale.append(ws)                 # collect dead sockets
+
+    for ws in stale:                         # prune once per tick
+        active_connections.remove(ws)
 # ----------------------------------------  #
+
+
 # Pydantic model for tick input
 class TickIn(BaseModel):
     npc_id: int
@@ -176,10 +192,14 @@ async def recall(npc_id: int):
 
 @app.get("/state_dump")
 async def get_state():
-    """Return all saved NPC positions."""
+    """Return all saved NPC positions from the database."""
     print("[DEBUG] /state_dump called")
     try:
-        positions = [{"npc_id": npc_id, **pos} for npc_id, pos in npc_positions.items()]
+        res = supabase.table("npc_state").select("*").execute()
+        positions = [
+            {"npc_id": row["npc_id"], "x": row["x"], "y": row["y"]}
+            for row in (res.data or [])
+        ]
         print(f"[DEBUG] Returning positions: {positions}")
         return positions
     except Exception as e:
@@ -208,18 +228,6 @@ def embed(text: str) -> list[float]:
         print(f"Error generating embedding: {e}")
         return []
 
-async def broadcast_action(npc_id: int, action: str):
-    """Send action to all connected WebSocket clients."""
-    message = {"npc_id": npc_id, "action": action}
-    for connection in active_connections[:]:  # Create a copy of the list
-        try:
-            await connection.send_json(message)
-        except Exception as e:
-            print(f"Error sending to websocket: {e}")
-            try:
-                active_connections.remove(connection)
-            except ValueError:
-                pass
 
 
 # (If this table already exists in your file, keep only one copy)
@@ -331,15 +339,15 @@ async def ticker():
             new_zone = extract_zone(thought)
             if new_zone and new_zone in ZONE_COORDS and new_zone != zone_now:
                 x, y = ZONE_COORDS[new_zone]
-                supabase.table("npc_state").upsert(
-                    {"npc_id": npc, "x": x, "y": y, "zone": new_zone}
-                ).execute()
+                supabase.rpc("upsert_npc_state", {"_npc_id": npc, "_zone": new_zone}).execute()
                 npc_zone[npc] = new_zone          # update cache
 
             # ── 4. broadcast emoji to viewers ───────────────────────
-            broadcast_npc_action(npc, emoji)
+            await broadcast_npc_action(npc, emoji, npc_zone.get(npc))
             print(f"[TICK] {char['name']} → {emoji} {thought}")
 
+        print("TICK LOOP STILL RUNNING: tick", tick_count)
+        
         await asyncio.sleep(5)
 
 @app.on_event("startup")
@@ -385,47 +393,67 @@ async def create_tick(tick: TickIn):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/reset")
+
+# ------------------------------------------------------------------
+# /reset  — wipe and reseed DB, then notify all viewers
+# ------------------------------------------------------------------
+@app.post("/reset")
 async def reset_world(request: Request):
-    """Reset the world state and broadcast reset signal."""
     try:
-        # 1) clear tables
-        supabase.table("memories").delete().neq("id", 0).execute()
-        supabase.table("npc_state").delete().neq("npc_id", 0).execute()
+        # 1️⃣  clear tables
+        supabase.rpc("wipe_memories").execute()
+        supabase.rpc("wipe_npc_state").execute()
 
-        # 2) seed fresh data
-        seeds = [
-            (1, 'plan', 'Moira promised I could debut "Barnyard Cat" tonight'),
-            (2, 'plan', 'I mapped optimal escape routes from barn to motel room 3B'),
-            (3, 'plan', 'Beet sales pitch must reach at least three party-goers'),
-            (4, 'plan', 'Moira said "Just mingle, don\'t hijack". Must hijack.'),
-            (5, 'plan', 'Stevie bet I wouldn\'t last 30 min without complaining'),
-            (6, 'plan', 'Tonight\'s donations must exceed Jocelyn\'s bake-sale total'),
+        # 2️⃣  seed fresh PLAN memories
+        plan_seeds = [
+            (1, 'Moira promised I could debut "Barnyard Cat" tonight'),
+            (2, "I mapped optimal escape routes from barn to motel room 3B"),
+            (3, "Beet sales pitch must reach at least three party-goers"),
+            (4, 'Moira said "Just mingle, don\'t hijack". Must hijack.'),
+            (5, "Stevie bet I wouldn't last 30 min without complaining"),
+            (6, "Tonight's donations must exceed Jocelyn's bake-sale total"),
         ]
-        for npc, kind, text in seeds:
+        for npc_id, txt in plan_seeds:
             supabase.table("memories").insert(
-                {"npc_id": npc, "kind": kind, "content": text, "embedding": None}
-            ).execute()
-            supabase.table("npc_state").upsert(
-                {"npc_id": npc, "x": 100 + 20 * npc, "y": 100, "zone": "ENTRANCE"}
+                {"npc_id": npc_id, "kind": "plan", "content": txt, "embedding": None}
             ).execute()
 
-        # Clear local state
-        npc_positions.clear()
-        
-        # 3) broadcast reset signal to all websocket clients
-        for connection in active_connections[:]:  # Use a copy of the list
+        # 3️⃣  wipe + reseed npc_state in one shot
+        seed_pos = [
+            {"npc_id": 1, "x": 100, "y": 100, "zone": "ENTRANCE"},
+            {"npc_id": 2, "x": 130, "y": 100, "zone": "ENTRANCE"},
+            {"npc_id": 3, "x": 160, "y": 100, "zone": "ENTRANCE"},
+            {"npc_id": 4, "x": 190, "y": 100, "zone": "ENTRANCE"},
+            {"npc_id": 5, "x": 220, "y": 100, "zone": "ENTRANCE"},
+            {"npc_id": 6, "x": 250, "y": 100, "zone": "ENTRANCE"},
+        ]
+
+        supabase.rpc("reset_npc_state", {"seed_pos": seed_pos}).execute()
+
+        # DEBUG — fetch rows immediately after the RPC
+        check = supabase.table("npc_state").select("*").execute()
+        print("NPC_STATE after reset →", check)
+
+        # for npc_id, zone, x, y in seed_pos:
+        #     resp = supabase.table("npc_state").upsert(
+        #         {"npc_id": npc_id, "x": x, "y": y, "zone": zone}
+        #     ).execute()
+        #     print("UPSERT npc_state", npc_id, "→", resp)
+
+        # 4️⃣  clear any in-memory caches
+        npc_positions.clear()        # ignore if variable doesn't exist
+
+        # 5️⃣  broadcast reset to all websocket clients
+        for ws in list(active_connections):
             try:
-                await connection.send_json({"type": "RESET"})
-            except Exception as e:
-                print(f"Error sending reset signal: {e}")
-                try:
-                    active_connections.remove(connection)
-                except ValueError:
-                    pass
+                await ws.send_json({"type": "RESET"})
+            except Exception:
+                active_connections.discard(ws)
 
         return {"status": "reset complete"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
+    except Exception as err:
+        raise HTTPException(status_code=500, detail=str(err))
 
 if __name__ == "__main__":
     import uvicorn
