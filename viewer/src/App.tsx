@@ -20,6 +20,14 @@ const randomPos = () => ({
   y: Math.random() * (HEIGHT - 40) + 20,
 });
 
+const ZONE: Record<string, { x: number; y: number }> = {
+  ENTRANCE: { x: 100, y: 100 },
+  BUFFET:   { x: 150, y: 250 },
+  DANCE:    { x: 350, y: 200 },
+  STAGE:    { x: 550, y: 150 },
+  QUIET:    { x: 300, y: 400 },
+};
+
 /* ───────────── Component ───────────── */
 export default function App() {
   const [npcs, setNpcs] = useState<Record<number, Npc>>({});
@@ -40,14 +48,15 @@ export default function App() {
   useEffect(() => {
     /* 1️⃣  load saved positions */
     fetch("http://localhost:8000/state_dump")
-      .then((r) => (r.ok ? r.json() : []))
-      .then((rows: { npc_id: number; x: number; y: number }[]) => {
-        const pre: Record<number, Npc> = {};
-        rows.forEach(({ npc_id, x, y }) => {
-          pre[npc_id] = { id: npc_id, x, y, emoji: "🙂" };
-        });
-        setNpcs(pre);
+    .then((r) => (r.ok ? r.json() : []))
+    .then((rows: { npc_id: number; zone: string }[]) => {
+      const obj: Record<number, Npc> = {};
+      rows.forEach(({ npc_id, zone }) => {
+        const { x, y } = ZONE[zone] ?? randomPos();
+        obj[npc_id] = { id: npc_id, x, y, emoji: "🙂" };
       });
+      setNpcs(obj);
+    });
 
     /* 2️⃣  open WebSocket (uses same hostname as page) */
     const host = window.location.hostname || "127.0.0.1";
@@ -56,31 +65,47 @@ export default function App() {
 
     ws.onopen = () => console.log("✅ WebSocket connected");
     ws.onmessage = (e) => {
-      const msg = JSON.parse(e.data);
-
-      /* Handle global reset broadcast */
+      const msg = JSON.parse(e.data) as {
+        type?: string;            // "RESET" for global wipes
+        npc_id?: number;
+        action?: string;
+        zone?: string;            // optional — we may add it later
+      };
+    
+      /* 1️⃣  Global reset broadcast */
       if (msg.type === "RESET") {
         setNpcs({});
         return;
       }
-
-      /* Handle normal NPC update */
-      const { npc_id, action } = msg as { npc_id: number; action: string };
+    
+      /* 2️⃣  Normal NPC update payload */
+      if (msg.npc_id === undefined || msg.action === undefined) return;
+    
       setNpcs((prev) => {
-        const current = prev[npc_id] ?? {
-          id: npc_id,
+        const current = prev[msg.npc_id] ?? {
+          id: msg.npc_id,
           ...randomPos(),
-          emoji: action,
+          emoji: msg.action,
         };
+    
+        /* ─ Zone override: if server sent a zone, use its fixed coords */
+        const zoneCoords = msg.zone ? ZONE[msg.zone] : undefined;
+    
+        /* ─ Otherwise: nudge position a little so they ‘wobble’ */
         const dx = (Math.random() - 0.5) * 20;
         const dy = (Math.random() - 0.5) * 20;
+    
         return {
           ...prev,
-          [npc_id]: {
+          [msg.npc_id]: {
             ...current,
-            x: Math.max(10, Math.min(WIDTH - 10, current.x + dx)),
-            y: Math.max(10, Math.min(HEIGHT - 10, current.y + dy)),
-            emoji: action,
+            x:
+              zoneCoords?.x ??
+              Math.max(10, Math.min(WIDTH - 10, current.x + dx)),
+            y:
+              zoneCoords?.y ??
+              Math.max(10, Math.min(HEIGHT - 10, current.y + dy)),
+            emoji: msg.action,
           },
         };
       });
