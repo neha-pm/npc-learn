@@ -448,7 +448,7 @@ async def reset_world(request: Request):
             try:
                 await ws.send_json({"type": "RESET"})
             except Exception:
-                active_connections.discard(ws)
+                active_connections.remove(ws)
 
         return {"status": "reset complete"}
 

@@ -1,6 +1,21 @@
 /* App.tsx – viewer */
 import { useEffect, useRef, useState, useCallback } from "react";
-import { Stage, Layer, Group, Text, Label, Tag } from "react-konva";
+import { Stage, Layer, Group, Text, Label, Tag, Image as KImage } from "react-konva";
+import useImage from "use-image"; 
+
+function Avatar({ id, size = 40 }: { id: number; size?: number }) {
+  const [img] = useImage(AVATAR[id] || "/avatars/default.png");
+  return (
+    <KImage
+      image={img}
+      width={size}
+      height={size}
+      offsetX={size / 2}
+      offsetY={size / 2}
+    />
+  );
+}
+
 
 const WIDTH = 800;
 const HEIGHT = 500;
@@ -10,7 +25,7 @@ type Npc = {
   id: number;
   x: number;
   y: number;
-  emoji: string;
+  bubble?: string;      // show this in a thought bubble
   tooltip?: string;
 };
 
@@ -29,7 +44,16 @@ const ZONE: Record<string, { x: number; y: number }> = {
   QUIET:    { x: 300, y: 400 },
 };
 
-/* deterministic offset so NPCs don’t pile up */
+const AVATAR: Record<number, string> = {
+  1: "/avatars/phoebe.png",
+  2: "/avatars/sheldon.png",
+  3: "/avatars/dwight.png",
+  4: "/avatars/michael.png",
+  5: "/avatars/david.png",
+  6: "/avatars/moira.png",
+};
+
+/* deterministic offset so NPCs don't pile up */
 const OFFSET = 18; // px
 
 /* ───────────── Component ───────────── */
@@ -70,7 +94,6 @@ export default function App() {
           id: npc_id,
           x: anchor.x + offX,
           y: anchor.y + offY,
-          emoji: "🙂",
         };
       });
       setNpcs(fresh);
@@ -106,17 +129,17 @@ export default function App() {
       }
       if (msg.npc_id === undefined || msg.action === undefined) return;
 
+      const { npc_id, action, zone } = msg as { npc_id: number; action: string; zone?: string };
       setNpcs((prev) => {
-        const current = prev[msg.npc_id] ?? {
-          id: msg.npc_id,
+        const current = prev[npc_id] ?? {
+          id: npc_id,
           ...randomPos(),
-          emoji: msg.action,
         };
 
         /* zone anchor + deterministic offset */
-        const anchor = msg.zone ? ZONE[msg.zone] : undefined;
-        const offsetX = (msg.npc_id % 4) * OFFSET;
-        const offsetY = Math.floor(msg.npc_id / 4) * OFFSET;
+        const anchor = zone ? ZONE[zone] : undefined;
+        const offsetX = (npc_id % 4) * OFFSET;
+        const offsetY = Math.floor(npc_id / 4) * OFFSET;
 
         /* wobble if no anchor */
         const dx = (Math.random() - 0.5) * 20;
@@ -124,7 +147,7 @@ export default function App() {
 
         return {
           ...prev,
-          [msg.npc_id]: {
+          [npc_id]: {
             ...current,
             x:
               anchor?.x !== undefined
@@ -134,7 +157,7 @@ export default function App() {
               anchor?.y !== undefined
                 ? anchor.y + offsetY
                 : Math.max(10, Math.min(HEIGHT - 10, current.y + dy)),
-            emoji: msg.action,
+            bubble: action,       // store thought emoji
           },
         };
       });
@@ -196,7 +219,24 @@ export default function App() {
                 }))
               }
             >
-              <Text text={n.emoji} fontSize={32} offsetX={16} offsetY={16} />
+              {/* avatar */}
+              <Avatar id={n.id} size={40} />
+
+              {/* thought bubble */}
+              {n.bubble && (
+                <Label offsetY={-30}>
+                  <Tag fill="#ffffff" stroke="#999" cornerRadius={4} />
+                  <Text
+                    text={n.bubble}
+                    fontSize={20}
+                    padding={4}
+                    fill="black"
+                    wrap="word"
+                    width={60}
+                    align="center"
+                  />
+                </Label>
+              )}
 
               {n.tooltip && (
                 <Label offsetY={40}>
