@@ -3,7 +3,7 @@ import asyncio
 import json
 import random
 from typing import List, Set, Dict
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from openai import OpenAI
@@ -227,6 +227,49 @@ async def create_tick(tick: TickIn):
         memories = result.data if result.data else []
         return [memory['content'] for memory in memories]
     
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/reset")
+async def reset_world(request: Request):
+    """Reset the world state and broadcast reset signal."""
+    try:
+        # 1) clear tables
+        supabase.table("memories").delete().neq("id", 0).execute()
+        supabase.table("npc_state").delete().neq("npc_id", 0).execute()
+
+        # 2) seed fresh data
+        seeds = [
+            (1, 'plan', 'Moira promised I could debut "Barnyard Cat" tonight'),
+            (2, 'plan', 'I mapped optimal escape routes from barn to motel room 3B'),
+            (3, 'plan', 'Beet sales pitch must reach at least three party-goers'),
+            (4, 'plan', 'Moira said "Just mingle, don\'t hijack". Must hijack.'),
+            (5, 'plan', 'Stevie bet I wouldn\'t last 30 min without complaining'),
+            (6, 'plan', 'Tonight\'s donations must exceed Jocelyn\'s bake-sale total'),
+        ]
+        for npc, kind, text in seeds:
+            supabase.table("memories").insert(
+                {"npc_id": npc, "kind": kind, "content": text, "embedding": None}
+            ).execute()
+            supabase.table("npc_state").upsert(
+                {"npc_id": npc, "x": 100 + 20 * npc, "y": 100, "zone": "ENTRANCE"}
+            ).execute()
+
+        # Clear local state
+        npc_positions.clear()
+        
+        # 3) broadcast reset signal to all websocket clients
+        for connection in active_connections[:]:  # Use a copy of the list
+            try:
+                await connection.send_json({"type": "RESET"})
+            except Exception as e:
+                print(f"Error sending reset signal: {e}")
+                try:
+                    active_connections.remove(connection)
+                except ValueError:
+                    pass
+
+        return {"status": "reset complete"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
