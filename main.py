@@ -10,6 +10,7 @@ from openai import OpenAI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from jinja2 import Environment, FileSystemLoader
 
 # Global constants  
 NPC_IDS = [1, 2, 3]
@@ -47,6 +48,12 @@ origins = [
     "http://127.0.0.1:5173",
     "*"
 ]
+
+# Jinja environment
+tmpl_env = Environment(loader=FileSystemLoader("prompts"))
+def render_tmpl(name: str, **kw) -> str:
+    """Render prompts/*.j2 with keyword args."""
+    return tmpl_env.get_template(name).render(**kw)
 
 app.add_middleware(
     CORSMiddleware,
