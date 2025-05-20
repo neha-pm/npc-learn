@@ -90,14 +90,21 @@ function isZoneKey(zone: string): zone is keyof typeof ZONE_EMOJI {
   return Object.prototype.hasOwnProperty.call(ZONE_EMOJI, zone);
 }
 
+/* Add this helper at the top or inside the component */
+function formatTime(time: string) {
+  const d = new Date(time);
+  return isNaN(d.getTime()) ? '' : d.toLocaleString();
+}
+
 /* ───────────── Component ───────────── */
 export default function App() {
   const [npcs, setNpcs] = useState<Record<number, Npc>>({});
   // currently selected NPC for detailed view
   const [selectedNpc, setSelectedNpc] = useState<number|null>(null);
-  const [selectedNpcRecall, setSelectedNpcRecall] = useState<string[]>([]);
+  const [selectedNpcRecall, setSelectedNpcRecall] = useState<(string | { content: string; time?: string })[]>([]);
   const [feed, setFeed] = useState<string[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
+  const [loadingRecall, setLoadingRecall] = useState(false);
 
   // Responsive canvas size
   const containerRef = useRef<HTMLDivElement>(null);
@@ -238,7 +245,7 @@ export default function App() {
   return (
     <div className="flex flex-col min-h-screen w-full bg-gray-900">
       <header className="w-full flex justify-between items-center px-6 py-4 bg-gray-800">
-        <h1 className="text-3xl font-bold text-white">Neha World</h1>
+        <h1 className="text-3xl font-bold text-white">Mingle</h1>
         <button
           onClick={handleReset}
           className="flex items-center space-x-2 px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600"
@@ -291,9 +298,13 @@ export default function App() {
                     draggable
                     onClick={() => {
                       setSelectedNpc(n.id);
+                      setLoadingRecall(true);
                       fetch(`http://localhost:8000/recall?npc_id=${n.id}`)
                         .then((r) => r.json())
-                        .then((data: { memories: string[] }) => setSelectedNpcRecall(data.memories || []));
+                        .then((data: { memories: any[] }) =>
+                          setSelectedNpcRecall(data.memories || [])
+                        )
+                        .finally(() => setLoadingRecall(false));
                     }}
                     onDragEnd={(e) => {
                       const { x, y } = e.target.position();
@@ -333,14 +344,34 @@ export default function App() {
               Connected NPCs: {npcArray.length}
             </p>
             {selectedNpc !== null && (
-              <div className="fixed inset-0 z-50 bg-black bg-opacity-60 flex items-center justify-center">
-                <div className="bg-white p-6 rounded-lg shadow-lg max-w-md w-full">
-                  <h2 className="text-2xl font-bold mb-4">Actions for NPC {selectedNpc}</h2>
-                  <ul className="list-disc list-inside space-y-1 max-h-60 overflow-y-auto mb-4">
-                    {selectedNpcRecall.map((act, idx) => (
-                      <li key={idx}>{act}</li>
-                    ))}
-                  </ul>
+              <div className="fixed inset-0 z-50 bg-black bg-opacity-60 flex items-center justify-center p-4 overflow-auto">
+                <div className="bg-white p-6 rounded-lg shadow-lg w-full max-w-lg max-h-[80vh] overflow-y-auto">
+                  <h2 className="text-2xl font-bold mb-4 text-black">{NPC_NAMES[selectedNpc]}'s Memories</h2>
+                  {loadingRecall ? (
+                    <div className="flex justify-center items-center py-8">
+                      <svg className="animate-spin h-8 w-8 text-gray-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"></path>
+                      </svg>
+                      <span className="ml-3 text-gray-600">Loading...</span>
+                    </div>
+                  ) : (
+                    <ul className="list-disc list-inside space-y-2 max-h-60 overflow-y-auto mb-4">
+                      {selectedNpcRecall.map((mem, idx) => {
+                        if (typeof mem === 'string') {
+                          return <li key={idx} className="text-black">{mem}</li>;
+                        }
+                        return (
+                          <li key={idx}>
+                            {mem.time && formatTime(mem.time) && (
+                              <span className="block text-xs text-gray-500">{formatTime(mem.time)}</span>
+                            )}
+                            <span className="text-black">{mem.content}</span>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
                   <button
                     onClick={() => {
                       setSelectedNpc(null);
